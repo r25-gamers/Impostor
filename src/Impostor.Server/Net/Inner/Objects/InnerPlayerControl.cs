@@ -297,6 +297,17 @@ namespace Impostor.Server.Net.Inner.Objects
                     break;
                 }
 
+                case RpcCalls.SendQuickChat:
+                {
+                    if (!await ValidateOwnership(call, sender))
+                    {
+                        return false;
+                    }
+
+                    // TODO: deserialize and expose the result in an API
+                    break;
+                }
+
                 default:
                     return await base.HandleRpcAsync(sender, target, call, reader);
             }
@@ -416,7 +427,7 @@ namespace Impostor.Server.Net.Inner.Objects
                     var i = 1;
                     while (true)
                     {
-                        string text = expected + " " + i;
+                        var text = expected + " " + i;
 
                         if (Game.Players.All(x => x.Character == null || x.Character == this || x.Character.PlayerInfo.PlayerName != text))
                         {

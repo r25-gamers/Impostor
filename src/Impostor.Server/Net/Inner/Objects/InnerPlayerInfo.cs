@@ -21,7 +21,7 @@ namespace Impostor.Server.Net.Inner.Objects
 
         public string PlayerName { get; internal set; } = string.Empty;
 
-        public ColorType Color { get; internal set; }
+        public ColorType Color { get; internal set; } = (ColorType)(-1);
 
         public HatType Hat { get; internal set; }
 
@@ -78,7 +78,6 @@ namespace Impostor.Server.Net.Inner.Objects
 
             for (var i = 0; i < taskCount; i++)
             {
-                Tasks[i] ??= new InnerGameData.TaskInfo();
                 Tasks[i].Deserialize(reader);
             }
         }

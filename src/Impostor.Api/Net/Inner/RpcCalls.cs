@@ -34,5 +34,8 @@
         SetTasks = 29,
         ClimbLadder = 31,
         UsePlatform = 32,
+        SendQuickChat = 33,
+        BootFromVent = 34,
+        UpdateSystem = 35,
     }
 }

@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Impostor.Api;
 using Impostor.Api.Events.Managers;
+using Impostor.Api.Events.Player;
 using Impostor.Api.Innersloth;
 using Impostor.Api.Net;
 using Impostor.Api.Net.Custom;
@@ -22,6 +25,8 @@ namespace Impostor.Server.Net.Inner.Objects
         private readonly ILogger<InnerMeetingHud> _logger;
         private readonly IEventManager _eventManager;
 
+        private readonly CancellationTokenSource _timerToken;
+
         [AllowNull]
         private PlayerVoteArea[] _playerStates;
 
@@ -32,9 +37,25 @@ namespace Impostor.Server.Net.Inner.Objects
             _playerStates = null;
 
             Components.Add(this);
+
+            _timerToken = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    const float AnimationTime = 0.25f + 0.5f + 0.4f + 3f + 0.75f + 5f;
+                    await Task.Delay(TimeSpan.FromSeconds(AnimationTime + Game.Options.DiscussionTime + Game.Options.VotingTime), _timerToken.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    return;
+                }
+
+                await HandleVotingCompleteAsync();
+            });
         }
 
-        public byte ReporterId { get; private set; }
+        public InnerPlayerInfo? Reporter { get; private set; }
 
         public override ValueTask<bool> SerializeAsync(IMessageWriter writer, bool initialState)
         {
@@ -50,27 +71,32 @@ namespace Impostor.Server.Net.Inner.Objects
 
             if (initialState)
             {
-                PopulateButtons(0);
-
-                foreach (var playerState in _playerStates)
-                {
-                    playerState.Deserialize(reader);
-
-                    if (playerState.DidReport)
-                    {
-                        ReporterId = playerState.TargetPlayerId;
-                    }
-                }
+                PopulateButtons();
             }
-            else
-            {
-                var num = reader.ReadPackedUInt32();
 
-                for (var i = 0; i < _playerStates.Length; i++)
+            var length = reader.ReadPackedUInt32();
+
+            for (var i = 0; i < length; i++)
+            {
+                var inner = reader.ReadMessage();
+                var playerVoteArea = _playerStates.SingleOrDefault(x => x.TargetPlayer.PlayerId == inner.Tag);
+
+                if (playerVoteArea != null)
                 {
-                    if ((num & 1 << i) != 0)
+                    var clientPlayer = Game.Players.SingleOrDefault(x => x.Character?.PlayerId == playerVoteArea.TargetPlayer.PlayerId);
+                    var updateVote = !playerVoteArea.DidVote && (clientPlayer?.IsHost ?? false) && playerVoteArea.VoteType != VoteType.Missed;
+
+                    playerVoteArea.Deserialize(inner, updateVote);
+
+                    if (updateVote)
                     {
-                        _playerStates[i].Deserialize(reader);
+                        await HandleVoteAsync(playerVoteArea);
+                        await CheckForEndVotingAsync();
+                    }
+
+                    if (initialState && playerVoteArea.DidReport)
+                    {
+                        Reporter = playerVoteArea.TargetPlayer;
                     }
                 }
             }
@@ -99,14 +125,17 @@ namespace Impostor.Server.Net.Inner.Objects
                     }
 
                     Rpc23VotingComplete.Deserialize(reader, out var states, out var playerId, out var tie);
-                    await HandleVotingComplete(sender, states, playerId, tie);
+
+                    // This would be a nice place to implement an anti cheat.
+                    // But for whatever reason host sends VotingComplete before sending his vote.
+                    // Also every client executes his own VotingComplete after other client players CastVote rpc, like wtf.
                     break;
                 }
 
                 case RpcCalls.CastVote:
                 {
                     Rpc24CastVote.Deserialize(reader, out var playerId, out var suspectPlayerId);
-                    return await HandleCastVote(sender, target, playerId, suspectPlayerId);
+                    return await HandleCastVoteAsync(sender, target, playerId, suspectPlayerId);
                 }
 
                 case RpcCalls.ClearVote:
@@ -127,34 +156,24 @@ namespace Impostor.Server.Net.Inner.Objects
             return true;
         }
 
-        private void PopulateButtons(byte reporter)
+        private void PopulateButtons()
         {
-            _playerStates = Game.GameNet.GameData!.Players
-                .Select(x =>
-                {
-                    var area = new PlayerVoteArea(this, x.Key);
-                    area.SetDead(x.Value.PlayerId == reporter, x.Value.Disconnected || x.Value.IsDead);
-                    return area;
-                })
+            _playerStates = Game.GameNet.GameData!.Players.Values
+                .OrderBy(x => x.Controller?.NetId) // The host player hold MeetingHud players list sorted by NetId
+                .Select(x => new PlayerVoteArea(this, x, x.Disconnected || x.IsDead))
                 .ToArray();
         }
 
-        private async ValueTask HandleVotingComplete(ClientPlayer sender, ReadOnlyMemory<byte> states, byte playerId, bool tie)
+        private async ValueTask HandleVoteAsync(PlayerVoteArea playerState)
         {
-            if (playerId != byte.MaxValue)
+            if (playerState.DidVote && !playerState.IsDead)
             {
-                var player = Game.GameNet.GameData!.GetPlayerById(playerId);
-                if (player?.Controller != null)
-                {
-                    player.Controller.Die(DeathReason.Exile);
-                    await _eventManager.CallAsync(new PlayerExileEvent(Game, sender, player.Controller));
-                }
+                var player = playerState.TargetPlayer.Controller!;
+                await _eventManager.CallAsync(new PlayerVotedEvent(Game, Game.GetClientPlayer(player!.OwnerId)!, player, playerState.VoteType!.Value, playerState.VotedFor));
             }
-
-            await _eventManager.CallAsync(new MeetingEndedEvent(Game, this));
         }
 
-        private async ValueTask<bool> HandleCastVote(ClientPlayer sender, ClientPlayer? target, byte playerId, sbyte suspectPlayerId)
+        private async ValueTask<bool> HandleCastVoteAsync(ClientPlayer sender, ClientPlayer? target, byte playerId, byte suspectPlayerId)
         {
             if (sender.IsHost)
             {
@@ -179,7 +198,90 @@ namespace Impostor.Server.Net.Inner.Objects
                 }
             }
 
+            if (!sender.IsHost)
+            {
+                var playerVoteArea = _playerStates.Single(x => x.TargetPlayer.PlayerId == playerId);
+                playerVoteArea.SetVotedFor(suspectPlayerId);
+                await HandleVoteAsync(playerVoteArea);
+                await CheckForEndVotingAsync();
+            }
+
             return true;
+        }
+
+        private async ValueTask CheckForEndVotingAsync()
+        {
+            if (_playerStates.All(ps => ps.IsDead || ps.DidVote))
+            {
+                await HandleVotingCompleteAsync();
+            }
+        }
+
+        private KeyValuePair<byte, int> MaxPair(Dictionary<byte, int> self, out bool tie)
+        {
+            tie = true;
+            var result = new KeyValuePair<byte, int>(byte.MaxValue, int.MinValue);
+            foreach (var keyValuePair in self)
+            {
+                if (keyValuePair.Value > result.Value)
+                {
+                    result = keyValuePair;
+                    tie = false;
+                }
+                else if (keyValuePair.Value == result.Value)
+                {
+                    tie = true;
+                }
+            }
+
+            return result;
+        }
+
+        private Dictionary<byte, int> CalculateVotes()
+        {
+            var players = new Dictionary<byte, int>();
+            foreach (var playerVoteArea in _playerStates)
+            {
+                if (!playerVoteArea.IsDead && playerVoteArea.DidVote && playerVoteArea.VoteType != VoteType.Missed)
+                {
+                    if (players.TryGetValue(playerVoteArea.VotedForId, out var current))
+                    {
+                        players[playerVoteArea.VotedForId] = current + 1;
+                    }
+                    else
+                    {
+                        players[playerVoteArea.VotedForId] = 1;
+                    }
+                }
+            }
+
+            return players;
+        }
+
+        private async ValueTask HandleVotingCompleteAsync()
+        {
+            _timerToken.Cancel();
+
+            foreach (var playerVoteArea in _playerStates)
+            {
+                if (!playerVoteArea.DidVote)
+                {
+                    playerVoteArea.SetVotedFor((byte)VoteType.Missed);
+                    await HandleVoteAsync(playerVoteArea);
+                }
+            }
+
+            var self = this.CalculateVotes();
+            var max = MaxPair(self, out var tie);
+            var exiled = tie ? null : Game.GameNet.GameData!.GetPlayerById(max.Key)?.Controller;
+
+            if (exiled != null)
+            {
+                exiled.Die(DeathReason.Exile);
+                await _eventManager.CallAsync(new PlayerExileEvent(Game, Game.GetClientPlayer(exiled!.OwnerId)!, exiled));
+            }
+
+            await _eventManager.CallAsync(new MeetingEndedEvent(Game, this, exiled, tie));
         }
     }
 }

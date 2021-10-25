@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Impostor.Api.Events.Managers;
-using Impostor.Api.Innersloth;
 using Impostor.Api.Net.Messages;
 using Impostor.Api.Net.Messages.Announcements;
 using Impostor.Hazel;
@@ -99,15 +98,6 @@ namespace Impostor.Server.Net
                 await e.Connection.SendAsync(writer);
 
                 _logger.LogDebug("Sent ({Id}) {Message}", announcement.Id, announcement.Message);
-            }
-
-            if (response.FreeWeekendState != FreeWeekendState.NotFree)
-            {
-                using var writer = MessageWriter.Get(MessageType.Reliable);
-                Message02SetFreeWeekend.Serialize(writer, response.FreeWeekendState);
-                await e.Connection.SendAsync(writer);
-
-                _logger.LogDebug("Sent {FreeWeekendState} weekend state", response.FreeWeekendState);
             }
 
             await e.Connection.Disconnect(null);

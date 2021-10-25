@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Impostor.Api;
+using Impostor.Api.Events.Managers;
 using Impostor.Api.Net;
 using Impostor.Api.Net.Custom;
 using Impostor.Api.Net.Inner;
@@ -19,11 +20,13 @@ namespace Impostor.Server.Net.Inner.Objects
     internal partial class InnerGameData : InnerNetObject, IInnerGameData
     {
         private readonly ILogger<InnerGameData> _logger;
+        private readonly IEventManager _eventManager;
         private readonly ConcurrentDictionary<byte, InnerPlayerInfo> _allPlayers;
 
-        public InnerGameData(ICustomMessageManager<ICustomRpc> customMessageManager, Game game, ILogger<InnerGameData> logger, IServiceProvider serviceProvider) : base(customMessageManager, game)
+        public InnerGameData(ICustomMessageManager<ICustomRpc> customMessageManager, Game game, ILogger<InnerGameData> logger, IEventManager eventManager, IServiceProvider serviceProvider) : base(customMessageManager, game)
         {
             _logger = logger;
+            _eventManager = eventManager;
             _allPlayers = new ConcurrentDictionary<byte, InnerPlayerInfo>();
 
             Components.Add(this);
@@ -133,6 +136,11 @@ namespace Impostor.Server.Net.Inner.Objects
             return null;
         }
 
+        internal void RemovePlayer(InnerPlayerControl control)
+        {
+            _allPlayers.TryRemove(control.PlayerInfo.PlayerId, out _);
+        }
+
         private void SetTasks(byte playerId, ReadOnlyMemory<byte> taskTypeIds)
         {
             var player = GetPlayerById(playerId);
@@ -149,12 +157,15 @@ namespace Impostor.Server.Net.Inner.Objects
 
             player.Tasks = new List<TaskInfo>(taskTypeIds.Length);
 
-            foreach (var taskId in taskTypeIds.ToArray())
+            var taskId = 0u;
+            foreach (var taskTypeId in taskTypeIds.Span)
             {
-                player.Tasks.Add(new TaskInfo
-                {
-                    Id = taskId,
-                });
+                player.Tasks.Add(new TaskInfo(
+                    player,
+                    _eventManager,
+                    taskId++,
+                    Game.GameNet!.ShipStatus!.Data.Tasks[taskTypeId]
+                ));
             }
         }
     }
